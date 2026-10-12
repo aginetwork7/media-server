@@ -3,8 +3,11 @@
 #include <string.h>
 #include <assert.h>
 #include <errno.h>
+#include <stdio.h>
 
-#define MOV_TRUN_MAX_SAMPLE_COUNT (1024 * 1024)
+// A five-minute fragment at very high video/audio frame rates remains well below this limit.
+#define MOV_TRUN_MAX_SAMPLE_COUNT (100 * 1024)
+#define MOV_TRUN_LARGE_SAMPLE_COUNT (10 * 1024)
 
 // 8.8.8 Track Fragment Run Box (p72)
 int mov_read_trun(struct mov_t* mov, const struct mov_box_t* box)
@@ -42,13 +45,23 @@ int mov_read_trun(struct mov_t* mov, const struct mov_box_t* box)
 		sample_entry_size += 4;
 
 	if (header_size > box->size || sample_count > MOV_TRUN_MAX_SAMPLE_COUNT ||
-		(sample_entry_size > 0 && sample_count > (box->size - header_size) / sample_entry_size))
+		(sample_entry_size > 0 && sample_count > (box->size - header_size) / sample_entry_size)) {
+		fprintf(stderr, "mov_read_trun rejected: samples=%u flags=0x%06x box_size=%llu entry_size=%llu\n",
+			sample_count, flags, (unsigned long long)box->size, (unsigned long long)sample_entry_size);
+		fflush(stderr);
 		return -EINVAL;
+	}
 
 	total_sample_count = (uint64_t)track->sample_count + sample_count + 1;
 	if (total_sample_count > UINT32_MAX ||
 		total_sample_count > (uint64_t)((size_t)-1) / sizeof(struct mov_sample_t))
 		return -EOVERFLOW;
+
+	if (sample_count >= MOV_TRUN_LARGE_SAMPLE_COUNT) {
+		fprintf(stderr, "mov_read_trun large fragment: samples=%u total=%llu flags=0x%06x box_size=%llu\n",
+			sample_count, (unsigned long long)total_sample_count, flags, (unsigned long long)box->size);
+		fflush(stderr);
+	}
 
 	if (sample_count > 0)
 	{
