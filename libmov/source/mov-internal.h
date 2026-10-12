@@ -184,6 +184,7 @@ struct mov_track_t
 	
 	struct mov_sample_t* samples;
 	uint32_t sample_count;
+	uint32_t fragment_sample_count; // read fmp4 only: samples from complete fragments
 	size_t sample_offset; // sample_capacity
 
     int64_t tfdt_dts; // tfdt baseMediaDecodeTime

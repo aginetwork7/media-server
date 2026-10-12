@@ -12,6 +12,12 @@ extern "C" {
 typedef struct mov_reader_t mov_reader_t;
 
 mov_reader_t* mov_reader_create(const struct mov_buffer_t* buffer, void* param);
+
+/// Same as mov_reader_create, but *reader is assigned before parsing starts, so a caller
+/// whose assert() throws (C++ builds) can still release it with mov_reader_destroy.
+/// @param[out] reader NULL on error return
+/// @return 0-ok, other-error
+int mov_reader_create2(const struct mov_buffer_t* buffer, void* param, mov_reader_t** reader);
 void mov_reader_destroy(mov_reader_t* mov);
 
 struct mov_reader_trackinfo_t
