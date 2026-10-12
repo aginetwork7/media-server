@@ -4,12 +4,15 @@
 #include <assert.h>
 #include <errno.h>
 
+#define MOV_TRUN_MAX_SAMPLE_COUNT (1024 * 1024)
+
 // 8.8.8 Track Fragment Run Box (p72)
 int mov_read_trun(struct mov_t* mov, const struct mov_box_t* box)
 {
 	unsigned int version;
 	uint32_t flags;
 	uint32_t i, sample_count;
+	uint64_t header_size, sample_entry_size, total_sample_count;
 	uint64_t data_offset;
 	uint32_t first_sample_flags;
 	uint32_t sample_duration, sample_size, sample_flags;
@@ -22,9 +25,34 @@ int mov_read_trun(struct mov_t* mov, const struct mov_box_t* box)
 	sample_count = mov_buffer_r32(&mov->io); /* sample_count */
 
 	track = mov->track;
+	header_size = 8; /* version/flags + sample_count */
+	if (MOV_TRUN_FLAG_DATA_OFFSET_PRESENT & flags)
+		header_size += 4;
+	if (MOV_TRUN_FLAG_FIRST_SAMPLE_FLAGS_PRESENT & flags)
+		header_size += 4;
+
+	sample_entry_size = 0;
+	if (MOV_TRUN_FLAG_SAMPLE_DURATION_PRESENT & flags)
+		sample_entry_size += 4;
+	if (MOV_TRUN_FLAG_SAMPLE_SIZE_PRESENT & flags)
+		sample_entry_size += 4;
+	if (MOV_TRUN_FLAG_SAMPLE_FLAGS_PRESENT & flags)
+		sample_entry_size += 4;
+	if (MOV_TRUN_FLAG_SAMPLE_COMPOSITION_TIME_OFFSET_PRESENT & flags)
+		sample_entry_size += 4;
+
+	if (header_size > box->size || sample_count > MOV_TRUN_MAX_SAMPLE_COUNT ||
+		(sample_entry_size > 0 && sample_count > (box->size - header_size) / sample_entry_size))
+		return -EINVAL;
+
+	total_sample_count = (uint64_t)track->sample_count + sample_count + 1;
+	if (total_sample_count > UINT32_MAX ||
+		total_sample_count > (uint64_t)((size_t)-1) / sizeof(struct mov_sample_t))
+		return -EOVERFLOW;
+
 	if (sample_count > 0)
 	{
-		void* p = realloc(track->samples, sizeof(struct mov_sample_t) * (track->sample_count + sample_count + 1));
+		void* p = realloc(track->samples, sizeof(struct mov_sample_t) * (size_t)total_sample_count);
 		if (NULL == p) return -ENOMEM;
 		track->samples = (struct mov_sample_t*)p;
 		memset(track->samples + track->sample_count, 0, sizeof(struct mov_sample_t) * (sample_count + 1));

@@ -82,8 +82,7 @@ static int mov_index_build(struct mov_track_t* track)
 		if (track->samples[i].flags & MOV_AV_FLAG_KEYFREAME)
 			stbl->stss[j++] = i + 1; // uint32_t sample_number, start from 1
 	}
-	assert(j == stbl->stss_count);
-	return 0;
+	return j == stbl->stss_count ? 0 : -1;
 }
 
 // 8.3.1 Track Box (p31)
@@ -342,10 +341,10 @@ int mov_reader_box(struct mov_t* mov, const struct mov_box_t* parent)
 			uint64_t pos, pos2;
 			pos = mov_buffer_tell(&mov->io);
 			r = parse(mov, &box);
-			assert(0 == r || mov_buffer_error(&mov->io));
 			if (0 != r) return r;
 			pos2 = mov_buffer_tell(&mov->io);
-			assert(pos2 - pos == box.size);
+			if (pos2 < pos || pos2 - pos != box.size)
+				return -1;
 			mov_buffer_skip(&mov->io, box.size - (pos2 - pos));
 		}
 
@@ -375,12 +374,15 @@ static int mov_reader_init(struct mov_reader_t* reader)
 
 	mov = &reader->mov;
 	r = mov_reader_root(mov);
-	if (0 != r) { /*return r;*/ }  // ignore file read error(for streaming file)
+	if (0 != r)
+		return r;
 
 	for (i = 0; i < mov->track_count; i++)
 	{
 		track = mov->tracks + i;
-		mov_index_build(track);
+		r = mov_index_build(track);
+		if (0 != r)
+			return r;
 		//track->sample_offset = 0; // reset
 		
 		// fragment mp4
