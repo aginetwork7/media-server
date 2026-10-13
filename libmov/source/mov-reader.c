@@ -623,7 +623,8 @@ FMP4_NEXT_FRAGMENT:
 	if (mov_buffer_error(&reader->mov.io))
 	{
 		// TODO: user free buffer
-		return mov_buffer_error(&reader->mov.io);
+		// 1 means "got a sample", never let a positive io error look like success
+		return mov_buffer_error(&reader->mov.io) > 0 ? -mov_buffer_error(&reader->mov.io) : mov_buffer_error(&reader->mov.io);
 	}
 
 	track->sample_offset += n + 1; //mark as read
