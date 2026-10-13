@@ -99,7 +99,7 @@ static int mov_read_trak(struct mov_t* mov, const struct mov_box_t* box)
     mov->track = NULL;
 	r = mov_reader_box(mov, box);
 	if (0 == r && NULL == mov->track)
-		return -1; // no tkhd
+		return -EINVAL; // no tkhd
 	if (0 == r)
 	{
         mov->track->tfdt_dts = 0;
@@ -355,6 +355,7 @@ int mov_reader_box(struct mov_t* mov, const struct mov_box_t* parent)
 	int is_root; // fragment completeness is tracked on top-level boxes only
 	int fragmented = 0; // root only: a moof has been seen
 	int pending = 0; // root only: moof parsed, its mdat not verified yet
+	uint64_t mdat_begin = 0, mdat_end = 0; // root only: payload range of the last top-level mdat already passed
 	uint64_t bytes = 0;
 	uint64_t pos, pos2;
 	struct mov_box_t box;
@@ -420,11 +421,13 @@ int mov_reader_box(struct mov_t* mov, const struct mov_box_t* parent)
 				fragmented = 1;
 				pending = 1;
 			}
-			else if (pending && MOV_TAG('m', 'd', 'a', 't') == box.type)
+			else if (MOV_TAG('m', 'd', 'a', 't') == box.type)
 			{
-				if (!mov_fragment_mdat_complete(mov, &box))
+				if (pending && !mov_fragment_mdat_complete(mov, &box))
 					return mov_fragment_rollback_and_end(mov, pending);
 				pending = 0;
+				mdat_begin = mov_buffer_tell(&mov->io);
+				mdat_end = mdat_begin + box.size;
 			}
 		}
 
@@ -457,6 +460,13 @@ int mov_reader_box(struct mov_t* mov, const struct mov_box_t* parent)
 			}
 			if (is_root && MOV_TAG('m', 'o', 'o', 'v') == box.type)
 				reader->moov_parsed = 1;
+			// mdat-before-moof layout (trun data_offset may be negative): if every new sample lies in the
+			// mdat just passed, the fragment is complete already; that mdat is fully present because the
+			// file is appended in order and this moof follows it. The writer's stale first-pass data_offset
+			// (0) points into the moof itself, so it still falls through to the following-mdat check.
+			if (is_root && pending && MOV_TAG('m', 'o', 'o', 'f') == box.type && mdat_end > mdat_begin
+				&& mov_fragment_samples_in_mdat(mov, mdat_begin, mdat_end))
+				pending = 0;
 			mov_buffer_skip(&mov->io, box.size - (pos2 - pos));
 		}
 
