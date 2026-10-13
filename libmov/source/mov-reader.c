@@ -75,6 +75,8 @@ static int mov_index_build(struct mov_track_t* track)
 			++stbl->stss_count;
 	}
 
+	if (0 == stbl->stss_count)
+		return 0; // no key frame (e.g. a recording that just started); realloc(.., 0) may return NULL
 	p = realloc(stbl->stss, sizeof(stbl->stss[0]) * stbl->stss_count);
 	if (!p) return -ENOMEM;
 	stbl->stss = p;
@@ -509,7 +511,14 @@ static int mov_reader_init(struct mov_reader_t* reader)
 	if (-ENOMEM == r)
 		return r;
 	if (!reader->moov_parsed)
-		return 0 != r ? r : -EINVAL;
+	{
+		if (0 != r)
+			return r;
+		// Tell a read failure from a missing moov. Read callbacks report a real io error as a positive
+		// ferror() value (reference mov-file-buffer.c) or a negative errno other than -1, and plain EOF as -1.
+		r = mov_buffer_error(&mov->io);
+		return r > 0 ? -EIO : (r < -1 ? r : -EINVAL);
+	}
 
 	for (i = 0; i < mov->track_count; i++)
 	{

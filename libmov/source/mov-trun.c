@@ -50,8 +50,13 @@ int mov_read_trun(struct mov_t* mov, const struct mov_box_t* box)
 	if (MOV_TRUN_FLAG_SAMPLE_COMPOSITION_TIME_OFFSET_PRESENT & flags)
 		sample_entry_size += 4;
 
+	// A defaults-only trun reads nothing per sample, so bound it by the samples it adds to the current
+	// fragment (all truns since the last complete fragment), and require a non-zero default sample size:
+	// every sample then occupies mdat bytes, and the fragment check (samples must lie in the mdat)
+	// bounds the total by the file size across fragments.
 	if (header_size > box->size ||
-		(0 == sample_entry_size && sample_count > MOV_TRUN_MAX_SAMPLE_COUNT) ||
+		(0 == sample_entry_size && sample_count > 0 && 0 == track->tfhd.default_sample_size) ||
+		(0 == sample_entry_size && (uint64_t)track->sample_count - track->committed_sample_count + sample_count > MOV_TRUN_MAX_SAMPLE_COUNT) ||
 		(sample_entry_size > 0 && sample_count > (box->size - header_size) / sample_entry_size))
 		return -EINVAL;
 
