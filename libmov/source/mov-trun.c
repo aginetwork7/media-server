@@ -4,7 +4,9 @@
 #include <assert.h>
 #include <errno.h>
 
-// A five-minute fragment at very high video/audio frame rates remains well below this limit.
+// Cap for a trun without per-sample fields: its sample_count is then not bounded by the box size,
+// so a corrupted value (e.g. 0x7FFFFFFF) would realloc+memset gigabytes. A trun with per-sample
+// fields is bounded by its box size instead and is not capped (e.g. PCM stored one sample per frame).
 #define MOV_TRUN_MAX_SAMPLE_COUNT (100 * 1024)
 
 // 8.8.8 Track Fragment Run Box (p72)
@@ -13,7 +15,7 @@ int mov_read_trun(struct mov_t* mov, const struct mov_box_t* box)
 	unsigned int version;
 	uint32_t flags;
 	uint32_t i, sample_count;
-	uint64_t header_size, sample_entry_size, total_sample_count;
+	uint64_t header_size, sample_entry_size, sample_capacity;
 	uint64_t data_offset;
 	uint32_t first_sample_flags;
 	uint32_t sample_duration, sample_size, sample_flags;
@@ -42,18 +44,19 @@ int mov_read_trun(struct mov_t* mov, const struct mov_box_t* box)
 	if (MOV_TRUN_FLAG_SAMPLE_COMPOSITION_TIME_OFFSET_PRESENT & flags)
 		sample_entry_size += 4;
 
-	if (header_size > box->size || sample_count > MOV_TRUN_MAX_SAMPLE_COUNT ||
+	if (header_size > box->size ||
+		(0 == sample_entry_size && sample_count > MOV_TRUN_MAX_SAMPLE_COUNT) ||
 		(sample_entry_size > 0 && sample_count > (box->size - header_size) / sample_entry_size))
 		return -EINVAL;
 
-	total_sample_count = (uint64_t)track->sample_count + sample_count + 1;
-	if (total_sample_count > UINT32_MAX ||
-		total_sample_count > (uint64_t)((size_t)-1) / sizeof(struct mov_sample_t))
+	sample_capacity = (uint64_t)track->sample_count + sample_count + 1;
+	if (sample_capacity > UINT32_MAX ||
+		sample_capacity > (uint64_t)((size_t)-1) / sizeof(struct mov_sample_t))
 		return -EOVERFLOW;
 
 	if (sample_count > 0)
 	{
-		void* p = realloc(track->samples, sizeof(struct mov_sample_t) * (size_t)total_sample_count);
+		void* p = realloc(track->samples, sizeof(struct mov_sample_t) * (size_t)sample_capacity);
 		if (NULL == p) return -ENOMEM;
 		track->samples = (struct mov_sample_t*)p;
 		memset(track->samples + track->sample_count, 0, sizeof(struct mov_sample_t) * (sample_count + 1));
