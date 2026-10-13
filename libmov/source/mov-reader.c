@@ -494,9 +494,12 @@ static int mov_reader_init(struct mov_reader_t* reader)
 	mov = &reader->mov;
 	r = mov_reader_root(mov);
 	// Errors after a complete moov (trailing garbage, truncated tail) are ignored as upstream always
-	// did (streaming file). Without a parsed moov the tracks may be half built, so fail instead.
-	if (0 != r && (!reader->moov_parsed || -ENOMEM == r))
+	// did (streaming file). Without a parsed moov (none yet, a size-0 placeholder, or one that failed
+	// to parse) the file has no usable tracks, so fail instead of returning an empty reader.
+	if (-ENOMEM == r)
 		return r;
+	if (!reader->moov_parsed)
+		return 0 != r ? r : -EINVAL;
 
 	for (i = 0; i < mov->track_count; i++)
 	{

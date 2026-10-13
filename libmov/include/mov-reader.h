@@ -11,7 +11,8 @@ extern "C" {
 
 typedef struct mov_reader_t mov_reader_t;
 
-/// Fails (NULL) when the file has no readable moov: a moov that fails to parse or a corrupted box before it.
+/// Fails (NULL) when no top-level moov parsed: no moov at all (e.g. a recording that just started),
+/// a moov that is still a size-0 placeholder or fails to parse, or a corrupted box before it.
 /// Errors after a complete moov (trailing garbage, truncated tail) are tolerated, as before.
 /// Fragmented MP4: parsing stops at the last complete fragment (moof parsed, its mdat fully readable and
 /// holding all of the fragment's samples); an incomplete or still-being-written tail is dropped silently.
