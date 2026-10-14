@@ -11,7 +11,19 @@ extern "C" {
 
 typedef struct mov_reader_t mov_reader_t;
 
+/// Fails (NULL) when no top-level moov parsed: no moov at all (e.g. a recording that just started),
+/// a moov that is still a size-0 placeholder or fails to parse, or a corrupted box before it.
+/// Errors after a complete moov (trailing garbage, truncated tail) are tolerated, as before.
+/// Fragmented MP4: parsing stops at the last complete fragment (moof parsed, its mdat fully readable and
+/// holding all of the fragment's samples); an incomplete or still-being-written tail is dropped silently.
 mov_reader_t* mov_reader_create(const struct mov_buffer_t* buffer, void* param);
+
+/// Same as mov_reader_create, but *reader is assigned before parsing starts. Some builds redefine
+/// assert() to throw a C++ exception (e.g. ZLMediaKit's 3rdpart/assert.h); with mov_reader_create the
+/// half-parsed reader would then leak, with this API the caller can still mov_reader_destroy() it.
+/// @param[out] reader NULL on error return
+/// @return 0-ok, other-error (negative errno)
+int mov_reader_create2(const struct mov_buffer_t* buffer, void* param, mov_reader_t** reader);
 void mov_reader_destroy(mov_reader_t* mov);
 
 struct mov_reader_trackinfo_t

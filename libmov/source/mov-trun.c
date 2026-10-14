@@ -4,12 +4,24 @@
 #include <assert.h>
 #include <errno.h>
 
+// Cap for a trun without per-sample fields: all its entries come from tfhd/trex defaults, so its
+// sample_count is bounded by nothing in the file and a corrupted value (e.g. 0x7FFFFFFF) would
+// allocate gigabytes. 1M samples (about 21s of 48kHz audio stored one sample per PCM frame, ~64MB
+// of sample table) is far above any fragment we write or read; a defaults-only trun above it is
+// rejected, which ends parsing at the previous fragment.
+#define MOV_TRUN_MAX_SAMPLE_COUNT (1024 * 1024)
+// The sample table grows in chunks while entries are actually read, so a trun whose declared
+// box size is corrupted (bounded only by its parent's declared size) can't preallocate more than
+// one chunk beyond what the file really contains.
+#define MOV_TRUN_ALLOC_CHUNK (64 * 1024)
+
 // 8.8.8 Track Fragment Run Box (p72)
 int mov_read_trun(struct mov_t* mov, const struct mov_box_t* box)
 {
 	unsigned int version;
 	uint32_t flags;
 	uint32_t i, sample_count;
+	uint64_t header_size, sample_entry_size, sample_capacity;
 	uint64_t data_offset;
 	uint32_t first_sample_flags;
 	uint32_t sample_duration, sample_size, sample_flags;
@@ -22,13 +34,36 @@ int mov_read_trun(struct mov_t* mov, const struct mov_box_t* box)
 	sample_count = mov_buffer_r32(&mov->io); /* sample_count */
 
 	track = mov->track;
-	if (sample_count > 0)
-	{
-		void* p = realloc(track->samples, sizeof(struct mov_sample_t) * (track->sample_count + sample_count + 1));
-		if (NULL == p) return -ENOMEM;
-		track->samples = (struct mov_sample_t*)p;
-		memset(track->samples + track->sample_count, 0, sizeof(struct mov_sample_t) * (sample_count + 1));
-	}
+	header_size = 8; /* version/flags + sample_count */
+	if (MOV_TRUN_FLAG_DATA_OFFSET_PRESENT & flags)
+		header_size += 4;
+	if (MOV_TRUN_FLAG_FIRST_SAMPLE_FLAGS_PRESENT & flags)
+		header_size += 4;
+
+	sample_entry_size = 0;
+	if (MOV_TRUN_FLAG_SAMPLE_DURATION_PRESENT & flags)
+		sample_entry_size += 4;
+	if (MOV_TRUN_FLAG_SAMPLE_SIZE_PRESENT & flags)
+		sample_entry_size += 4;
+	if (MOV_TRUN_FLAG_SAMPLE_FLAGS_PRESENT & flags)
+		sample_entry_size += 4;
+	if (MOV_TRUN_FLAG_SAMPLE_COMPOSITION_TIME_OFFSET_PRESENT & flags)
+		sample_entry_size += 4;
+
+	// A defaults-only trun reads nothing per sample, so bound it by the samples it adds to the current
+	// fragment (all truns since the last complete fragment), and require a non-zero default sample size:
+	// every sample then occupies mdat bytes, and the fragment check (samples must lie in the mdat)
+	// bounds the total by the file size across fragments.
+	if (header_size > box->size ||
+		(0 == sample_entry_size && sample_count > 0 && 0 == track->tfhd.default_sample_size) ||
+		(0 == sample_entry_size && (uint64_t)track->sample_count - track->committed_sample_count + sample_count > MOV_TRUN_MAX_SAMPLE_COUNT) ||
+		(sample_entry_size > 0 && sample_count > (box->size - header_size) / sample_entry_size))
+		return -EINVAL;
+
+	sample_capacity = (uint64_t)track->sample_count + sample_count + 1;
+	if (sample_capacity > UINT32_MAX ||
+		sample_capacity > (uint64_t)((size_t)-1) / sizeof(struct mov_sample_t))
+		return -EOVERFLOW;
 
 	data_offset = track->tfhd.base_data_offset;
 	if (MOV_TRUN_FLAG_DATA_OFFSET_PRESENT & flags)
@@ -39,9 +74,18 @@ int mov_read_trun(struct mov_t* mov, const struct mov_box_t* box)
 	else
 		first_sample_flags = track->tfhd.flags;
 
-	sample = track->samples + track->sample_count;
 	for (i = 0; i < sample_count; i++)
 	{
+		if (0 == i % MOV_TRUN_ALLOC_CHUNK)
+		{
+			uint32_t n = sample_count - i < MOV_TRUN_ALLOC_CHUNK ? sample_count - i : MOV_TRUN_ALLOC_CHUNK;
+			void* p = realloc(track->samples, sizeof(struct mov_sample_t) * ((size_t)track->sample_count + i + n + 1));
+			if (NULL == p) return -ENOMEM;
+			track->samples = (struct mov_sample_t*)p;
+			memset(track->samples + track->sample_count + i, 0, sizeof(struct mov_sample_t) * (n + 1));
+		}
+		sample = track->samples + track->sample_count;
+
 		if (MOV_TRUN_FLAG_SAMPLE_DURATION_PRESENT & flags)
 			sample_duration = mov_buffer_r32(&mov->io); /* sample_duration*/
 		else
@@ -65,6 +109,10 @@ int mov_read_trun(struct mov_t* mov, const struct mov_box_t* box)
 		}
 		else
 			sample_composition_time_offset = 0;
+
+		// out of data (truncated or corrupted box size): stop before growing further
+		if (0 != mov_buffer_error(&mov->io))
+			return mov_buffer_error(&mov->io);
 
 		sample[i].offset = data_offset;
 		sample[i].bytes = sample_size;

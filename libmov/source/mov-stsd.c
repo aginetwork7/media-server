@@ -321,6 +321,8 @@ int mov_read_stsd(struct mov_t* mov, const struct mov_box_t* box)
 		void* p = realloc(track->stsd.entries, sizeof(track->stsd.entries[0]) * entry_count);
 		if (NULL == p) return -ENOMEM;
 		track->stsd.entries = (struct mov_sample_entry_t*)p;
+		// mov_free_track() walks entry_count entries, keep unparsed ones zeroed
+		memset(track->stsd.entries + track->stsd.entry_count, 0, sizeof(track->stsd.entries[0]) * (entry_count - track->stsd.entry_count));
 	}
 
 	track->stsd.entry_count = entry_count;

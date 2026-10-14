@@ -40,6 +40,9 @@ permissions:
 
 jobs:
   Analysis:
+    # 上游 ireader/media-server 的 SonarCloud 项目，fork 没有 SONAR_TOKEN，只在上游仓库运行
+    # Upstream's SonarCloud project; forks have no SONAR_TOKEN, so only run in the upstream repository
+    if: github.repository == 'ireader/media-server'
     runs-on: ubuntu-latest
 
     steps:

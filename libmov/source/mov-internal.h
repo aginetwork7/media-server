@@ -184,6 +184,7 @@ struct mov_track_t
 	
 	struct mov_sample_t* samples;
 	uint32_t sample_count;
+	uint32_t committed_sample_count; // read fmp4 only: cumulative sample_count up to the last complete fragment
 	size_t sample_offset; // sample_capacity
 
     int64_t tfdt_dts; // tfdt baseMediaDecodeTime

@@ -11,7 +11,7 @@
 
 #define AV_TRACK_TIMEBASE 1000
 
-#define MOV_READER_BOX_TREE 1
+//#define MOV_READER_BOX_TREE 1
 //#define MOV_READER_FMP4_FAST 1
 
 #define MOV_READER_FLAG_FMP4_FAST 0x01
@@ -20,6 +20,8 @@ struct mov_reader_t
 {
 	int flags;
 	int have_read_mfra;
+	int fragment_on_demand; // fmp4 fast mode: fragments after the first are read by mfra index
+	int moov_parsed; // a top-level moov parsed without error
 	
 	struct mov_t mov;
 };
@@ -73,6 +75,8 @@ static int mov_index_build(struct mov_track_t* track)
 			++stbl->stss_count;
 	}
 
+	if (0 == stbl->stss_count)
+		return 0; // no key frame (e.g. a recording that just started); realloc(.., 0) may return NULL
 	p = realloc(stbl->stss, sizeof(stbl->stss[0]) * stbl->stss_count);
 	if (!p) return -ENOMEM;
 	stbl->stss = p;
@@ -82,8 +86,7 @@ static int mov_index_build(struct mov_track_t* track)
 		if (track->samples[i].flags & MOV_AV_FLAG_KEYFREAME)
 			stbl->stss[j++] = i + 1; // uint32_t sample_number, start from 1
 	}
-	assert(j == stbl->stss_count);
-	return 0;
+	return j == stbl->stss_count ? 0 : -EINVAL;
 }
 
 // 8.3.1 Track Box (p31)
@@ -97,6 +100,8 @@ static int mov_read_trak(struct mov_t* mov, const struct mov_box_t* box)
 
     mov->track = NULL;
 	r = mov_reader_box(mov, box);
+	if (0 == r && NULL == mov->track)
+		return -EINVAL; // no tkhd
 	if (0 == r)
 	{
         mov->track->tfdt_dts = 0;
@@ -274,15 +279,93 @@ static struct mov_parse_t s_mov_parse_table[] = {
 	{ 0, 0, NULL } // last
 };
 
-int mov_reader_box(struct mov_t* mov, const struct mov_box_t* parent)
+static void mov_fragment_commit(struct mov_t* mov)
 {
 	int i;
+	for (i = 0; i < mov->track_count; i++)
+		mov->tracks[i].committed_sample_count = mov->tracks[i].sample_count;
+}
+
+// A recording file can be read while it is still being written: the fmp4 writer
+// emits moof with zero placeholder sizes, patches them by seeking back, rewrites
+// the moof for trun data_offset, and only then appends a buffered mdat. So a
+// fragment counts only after its moof parsed cleanly, its whole mdat is readable and
+// every new sample lies inside that mdat; parsing ends at the first fragment that
+// fails this, and that fragment's samples are rolled back.
+// Always returns 0: ending at the last complete fragment is not an error.
+static int mov_fragment_rollback_and_end(struct mov_t* mov, int pending)
+{
+	int i;
+	if (pending)
+	{
+		for (i = 0; i < mov->track_count; i++)
+			mov->tracks[i].sample_count = mov->tracks[i].committed_sample_count;
+	}
+	return 0;
+}
+
+// samples added since the last commit must point into this mdat's payload, otherwise the moof
+// was parsed before the writer rewrote its trun data_offset (first write uses data_offset 0)
+static int mov_fragment_samples_in_mdat(const struct mov_t* mov, uint64_t begin, uint64_t end)
+{
+	int i;
+	uint32_t j;
+	const struct mov_track_t* track;
+	for (i = 0; i < mov->track_count; i++)
+	{
+		track = mov->tracks + i;
+		for (j = track->committed_sample_count; j < track->sample_count; j++)
+		{
+			if (track->samples[j].offset < begin || track->samples[j].offset > end || track->samples[j].bytes > end - track->samples[j].offset)
+				return 0;
+		}
+	}
+	return 1;
+}
+
+static int mov_fragment_mdat_complete(struct mov_t* mov, const struct mov_box_t* box)
+{
+	uint8_t v;
+	uint64_t pos;
+
+	if (UINT64_MAX == box->size)
+		return 0; // runs to the end of file, can't tell whether it is complete
+
+	pos = mov_buffer_tell(&mov->io);
+	if (!mov_fragment_samples_in_mdat(mov, pos, pos + box->size))
+		return 0;
+	if (0 == box->size)
+		return 1;
+
+	mov_buffer_seek(&mov->io, pos + box->size - 1);
+	mov_buffer_read(&mov->io, &v, 1); // file is appended in order: last byte present => whole mdat present
+	if (0 != mov_buffer_error(&mov->io))
+		return 0;
+	mov_buffer_seek(&mov->io, pos);
+	return 0 == mov_buffer_error(&mov->io);
+}
+
+// top-level boxes allowed between a moof and its mdat
+static int mov_fragment_filler_box(uint32_t type)
+{
+	return MOV_TAG('f', 'r', 'e', 'e') == type || MOV_TAG('s', 'k', 'i', 'p') == type || MOV_TAG('u', 'u', 'i', 'd') == type;
+}
+
+int mov_reader_box(struct mov_t* mov, const struct mov_box_t* parent)
+{
+	int i, r;
+	int is_root; // fragment completeness is tracked on top-level boxes only
+	int fragmented = 0; // root only: a moof has been seen
+	int pending = 0; // root only: moof parsed, its mdat not verified yet
+	uint64_t mdat_begin = 0, mdat_end = 0; // root only: payload range of the last top-level mdat already passed
 	uint64_t bytes = 0;
+	uint64_t pos, pos2;
 	struct mov_box_t box;
 	struct mov_reader_t* reader;
 	int (*parse)(struct mov_t* mov, const struct mov_box_t* box);
 
 	reader = MOV_READER_FROM_MOV(mov);
+	is_root = MOV_ROOT == parent->type;
 	while (bytes + 8 < parent->size && 0 == mov_buffer_error(&mov->io))
 	{
 		uint64_t n = 8;
@@ -305,22 +388,50 @@ int mov_reader_box(struct mov_t* mov, const struct mov_box_t* parent)
 		else if (0 == box.size)
 		{
 			if (0 == box.type)
-				return 0; // all done
-			box.size = UINT64_MAX;
+			{
+				// a nested box running into end of file is truncated, not done
+				if (!is_root && mov_buffer_error(&mov->io))
+					return -EINVAL;
+				return mov_fragment_rollback_and_end(mov, pending); // all done
+			}
+			// A zero size inside another box is the placeholder of a box still being written.
+			if (!is_root)
+				return -EINVAL;
+			// At top level a zero size means "runs to end of file", so nothing follows it. Only an
+			// mdat is accepted that way: for any other box (moov, moof, mfra) it is the writer's
+			// placeholder of a box still being written, which can't be told apart and isn't parsed.
+			// An mdat closing a pending fragment can't be verified either, so that fragment is dropped.
+			return mov_fragment_rollback_and_end(mov, pending);
 		}
 
-		if (UINT64_MAX == box.size)
-		{
-			bytes = parent->size;
-		}
-		else
-		{
-			bytes += box.size;
-			box.size -= n;
-		}
+		if (box.size < n)
+			return fragmented ? mov_fragment_rollback_and_end(mov, pending) : -EINVAL;
+		bytes += box.size;
+		box.size -= n;
 
 		if (bytes > parent->size)
 			return -1;
+
+		if (is_root)
+		{
+			if (pending && MOV_TAG('m', 'd', 'a', 't') != box.type && !mov_fragment_filler_box(box.type))
+				return mov_fragment_rollback_and_end(mov, pending);
+
+			if (MOV_TAG('m', 'o', 'o', 'f') == box.type)
+			{
+				mov_fragment_commit(mov);
+				fragmented = 1;
+				pending = 1;
+			}
+			else if (MOV_TAG('m', 'd', 'a', 't') == box.type)
+			{
+				if (pending && !mov_fragment_mdat_complete(mov, &box))
+					return mov_fragment_rollback_and_end(mov, pending);
+				pending = 0;
+				mdat_begin = mov_buffer_tell(&mov->io);
+				mdat_end = mdat_begin + box.size;
+			}
+		}
 
 		for (i = 0, parse = NULL; s_mov_parse_table[i].type && !parse; i++)
 		{
@@ -338,14 +449,26 @@ int mov_reader_box(struct mov_t* mov, const struct mov_box_t* parent)
 		}
 		else
 		{
-			int r;
-			uint64_t pos, pos2;
 			pos = mov_buffer_tell(&mov->io);
 			r = parse(mov, &box);
-			assert(0 == r || mov_buffer_error(&mov->io));
-			if (0 != r) return r;
 			pos2 = mov_buffer_tell(&mov->io);
-			assert(pos2 - pos == box.size);
+			// reading less than box size is tolerated (skip the rest), reading past it is corruption
+			if (0 == r && (pos2 < pos || pos2 - pos > box.size))
+				r = -EINVAL;
+			if (0 != r)
+			{
+				// after the first moof a parse error means an incomplete tail, except running out of memory
+				return fragmented && -ENOMEM != r ? mov_fragment_rollback_and_end(mov, pending) : r;
+			}
+			if (is_root && MOV_TAG('m', 'o', 'o', 'v') == box.type)
+				reader->moov_parsed = 1;
+			// mdat-before-moof layout (trun data_offset may be negative): if every new sample lies in the
+			// mdat just passed, the fragment is complete already; that mdat is fully present because the
+			// file is appended in order and this moof follows it. The writer's stale first-pass data_offset
+			// (0) points into the moof itself, so it still falls through to the following-mdat check.
+			if (is_root && pending && MOV_TAG('m', 'o', 'o', 'f') == box.type && mdat_end > mdat_begin
+				&& mov_fragment_samples_in_mdat(mov, mdat_begin, mdat_end))
+				pending = 0;
 			mov_buffer_skip(&mov->io, box.size - (pos2 - pos));
 		}
 
@@ -360,10 +483,17 @@ int mov_reader_box(struct mov_t* mov, const struct mov_box_t* parent)
 
 			// skip fast mode, fallback to read all
 			if(mov->mfro > 0)
+			{
+				pending = 0; // mfra present: file is complete, rest fragments are read on demand
+				reader->fragment_on_demand = 1;
 				break;
+			}
 		}
 	}
 
+	// root: running out of data ends parsing, the file may be truncated or still growing
+	if (is_root)
+		return mov_fragment_rollback_and_end(mov, pending);
 	return mov_buffer_error(&mov->io) ? -1 : 0;
 }
 
@@ -375,12 +505,40 @@ static int mov_reader_init(struct mov_reader_t* reader)
 
 	mov = &reader->mov;
 	r = mov_reader_root(mov);
-	if (0 != r) { /*return r;*/ }  // ignore file read error(for streaming file)
+	// Errors after a complete moov (trailing garbage, truncated tail) are ignored as upstream always
+	// did (streaming file). Without a parsed moov (none yet, a size-0 placeholder, or one that failed
+	// to parse) the file has no usable tracks, so fail instead of returning an empty reader.
+	if (-ENOMEM == r)
+		return r;
+	if (!reader->moov_parsed)
+	{
+		if (0 != r)
+			return r;
+		// Tell a read failure from a missing moov. Read callbacks report a real io error as a positive
+		// ferror() value (reference mov-file-buffer.c) or a negative errno other than -1, and plain EOF as -1.
+		r = mov_buffer_error(&mov->io);
+		return r > 0 ? -EIO : (r < -1 ? r : -EINVAL);
+	}
 
 	for (i = 0; i < mov->track_count; i++)
 	{
 		track = mov->tracks + i;
-		mov_index_build(track);
+		// tfra entries are usable only if the whole mfra (mfro is its last box) was read
+		if (0 == mov->mfro)
+			track->frag_count = 0;
+		// frag_capacity is fmp4-reader's "next fragment to load on demand" cursor. When the scan above
+		// already loaded every fragment, mark them all consumed so reading doesn't load them again
+		// from the mfra index (every frame of a closed file was returned twice).
+		if (!reader->fragment_on_demand)
+			track->frag_capacity = track->frag_count;
+	}
+
+	for (i = 0; i < mov->track_count; i++)
+	{
+		track = mov->tracks + i;
+		r = mov_index_build(track);
+		if (0 != r)
+			return r;
 		//track->sample_offset = 0; // reset
 		
 		// fragment mp4
@@ -395,32 +553,46 @@ static int mov_reader_init(struct mov_reader_t* reader)
 	return 0;
 }
 
-struct mov_reader_t* mov_reader_create(const struct mov_buffer_t* buffer, void* param)
+int mov_reader_create2(const struct mov_buffer_t* buffer, void* param, struct mov_reader_t** reader)
 {
-	struct mov_reader_t* reader;
-	reader = (struct mov_reader_t*)calloc(1, sizeof(*reader));
-	if (NULL == reader)
-		return NULL;
+	int r;
+	struct mov_reader_t* p;
+	*reader = NULL;
+	p = (struct mov_reader_t*)calloc(1, sizeof(*p));
+	if (NULL == p)
+		return -ENOMEM;
 
 #if defined(MOV_READER_FMP4_FAST)
-	reader->flags |= MOV_READER_FLAG_FMP4_FAST;
+	p->flags |= MOV_READER_FLAG_FMP4_FAST;
 #endif
 
 	// ISO/IEC 14496-12:2012(E) 4.3.1 Definition (p17)
 	// Files with no file-type box should be read as if they contained an FTYP box 
 	// with Major_brand='mp41', minor_version=0, and the single compatible brand 'mp41'.
-	reader->mov.ftyp.major_brand = MOV_BRAND_MP41;
-	reader->mov.ftyp.minor_version = 0;
-	reader->mov.ftyp.brands_count = 0;
-	reader->mov.header = 0;
+	p->mov.ftyp.major_brand = MOV_BRAND_MP41;
+	p->mov.ftyp.minor_version = 0;
+	p->mov.ftyp.brands_count = 0;
+	p->mov.header = 0;
 
-	reader->mov.io.param = param;
-	memcpy(&reader->mov.io.io, buffer, sizeof(reader->mov.io.io));
-	if (0 != mov_reader_init(reader))
+	p->mov.io.param = param;
+	memcpy(&p->mov.io.io, buffer, sizeof(p->mov.io.io));
+
+	// Hand the reader out before parsing: assert() may throw in C++ builds, and the
+	// caller must still be able to destroy a partially parsed reader.
+	*reader = p;
+	r = mov_reader_init(p);
+	if (0 != r)
 	{
-		mov_reader_destroy(reader);
-		return NULL;
+		*reader = NULL;
+		mov_reader_destroy(p);
 	}
+	return r;
+}
+
+struct mov_reader_t* mov_reader_create(const struct mov_buffer_t* buffer, void* param)
+{
+	struct mov_reader_t* reader;
+	mov_reader_create2(buffer, param, &reader);
 	return reader;
 }
 
